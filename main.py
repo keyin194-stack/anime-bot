@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import time
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import aiosqlite
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
@@ -14,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-# Logging sozlamalari
+# Logging
 logging.basicConfig(level=logging.INFO)
 
 # --- BOT VA KANAL SOZLAMALARI ---
@@ -25,18 +27,29 @@ INSTAGRAM_URL = "https://www.instagram.com/cz_yagami?igsh=MWt2YzdzNWVrOTc0eA=="
 ADMIN_ID = 5560186689
 DB_NAME = "anime.db"
 
-# Anti-spam chegara vaqti (sekund)
 SPAM_THRESHOLD = 1.2
 LAST_MESSAGE_TIME = {}
 BROADCAST_STATE = 1
 
+# --- RENDER PORTINI ALDASH UCHUN DUMMY SERVER ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot ishlayapti!")
 
-# --- MA'LUMOTLAR BAZASI (SQLite Asinxron) ---
+    def log_message(self, format, *args):
+        return
+
+def run_dummy_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# --- DATABASE ---
 async def init_db():
     async with aiosqlite.connect(DB_NAME) as db:
-        await db.execute('''
-            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)
-        ''')
+        await db.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)')
         await db.execute('''
             CREATE TABLE IF NOT EXISTS animes (
                 code INTEGER PRIMARY KEY,
@@ -120,8 +133,7 @@ async def get_user_favorites(user_id: int):
         ''', (user_id,)) as cursor:
             return await cursor.fetchall()
 
-
-# --- TUGMALAR ---
+# --- KEYBOARDS ---
 def get_sub_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 Rasmiy Kanalimiz", url=CHANNEL_INVITE_LINK)],
@@ -143,8 +155,7 @@ def get_anime_action_keyboard(code: int):
     ]
     return InlineKeyboardMarkup(keyboard)
 
-
-# --- TEKSHIRUV KODI ---
+# --- CHECK SUBSCRIPTION ---
 async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
@@ -153,8 +164,7 @@ async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> boo
         logging.error(f"Obuna tekshirishda xatolik: {e}")
         return True
 
-
-# --- HANDLERLAR ---
+# --- HANDLERS ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     await add_user(user_id)
@@ -185,9 +195,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = time.time()
 
-    # Anti-Spam
     if user_id in LAST_MESSAGE_TIME and (now - LAST_MESSAGE_TIME[user_id]) < SPAM_THRESHOLD:
-        await update.message.reply_text("⚠️ **Iltimos, ketma-ket Juda tez xabar yubormang! (Anti-Spam)**", parse_mode="Markdown")
+        await update.message.reply_text("⚠️ **Iltimos, ketma-ket juda tez xabar yubormang!**", parse_mode="Markdown")
         return
     LAST_MESSAGE_TIME[user_id] = now
 
@@ -199,7 +208,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # Menyu matnlari
     if text == "🔍 Qidiruv":
         await update.message.reply_text("🔍 **Anime nomini yozib yuboring (masalan: `Death Note`):**", parse_mode="Markdown")
         return
@@ -226,7 +234,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛩️ **Anime Bot** — Sizga eng sevimli animelaringizni sifatli va tezkor taqdim etuvchi bot!", parse_mode="Markdown")
         return
 
-    # Kategoriya bo'yicha
     cats = await get_categories()
     if text in cats:
         animes = await get_animes_by_category(text)
@@ -236,7 +243,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(msg, parse_mode="Markdown")
         return
 
-    # Anime kodi orqali ko'rish
     if text.isdigit():
         code = int(text)
         anime = await get_anime_by_code(code)
@@ -253,7 +259,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Bunday kodli anime topilmadi yoki xabar kanaldan o'chirilgan!")
     else:
-        # Nom bo'yicha qidiruv
         results = await search_anime(text)
         if not results:
             await update.message.reply_text("❌ Afsuski, bunday nomli anime topilmadi.")
@@ -275,8 +280,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "❤️ Sevimlilarga qo'shildi!" if status else "💔 Sevimlilardan olib tashlandi!"
         await query.message.reply_text(text)
 
-
-# --- ADMIN PANEL VA BROADCAST ---
+# --- ADMIN PANEL ---
 async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
@@ -285,8 +289,8 @@ async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👑 **ADMIN PANEL**\n\n"
         f"📊 **Bot foydalanuvchilari:** `{count}` ta\n\n"
         f"⚙️ **Buyruqlar:**\n"
-        f"👉 `/add kod | nomi | kategoriya | post_id` - Animeni bazaga qo'shish\n"
-        f"👉 `/send` - Barcha obunachilarga xabar yuborish (Broadcast)",
+        f"👉 `/add kod | nomi | kategoriya | post_id`\n"
+        f"👉 `/send` - Broadcast yuborish",
         parse_mode="Markdown"
     )
 
@@ -309,19 +313,19 @@ async def add_anime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await update.message.reply_text("📢 **Barcha foydalanuvchilarga yuboriladigan xabarni kiriting (yoki /cancel deb yozing):**")
+    await update.message.reply_text("📢 **Barcha foydalanuvchilarga yuboriladigan xabarni kiriting (yoki /cancel yozing):**")
     return BROADCAST_STATE
 
 async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users = await get_all_users()
     count = 0
-    await update.message.reply_text("🚀 Broadcast xabarlarini yuborish boshlandi...")
+    await update.message.reply_text("🚀 Broadcast boshlandi...")
 
     for u_id in users:
         try:
             await update.message.copy(chat_id=u_id)
             count += 1
-            await asyncio.sleep(0.04) # Telegram chekloviga tushmaslik uchun
+            await asyncio.sleep(0.04)
         except Exception:
             pass
 
@@ -332,16 +336,17 @@ async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Broadcast bekor qilindi.")
     return ConversationHandler.END
 
-
-# --- ISHGA TUSHIRISH (MAIN) ---
+# --- MAIN ---
 def main():
+    # Render Port xatosini oldini olish uchun dummy web serverni alohida potokda ishga tushiramiz
+    threading.Thread(target=run_dummy_server, daemon=True).start()
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(init_db())
 
     app = Application.builder().token(TOKEN).build()
 
-    # Broadcast conversation
     broadcast_handler = ConversationHandler(
         entry_points=[CommandHandler("send", start_broadcast)],
         states={BROADCAST_STATE: [MessageHandler(filters.ALL & ~filters.COMMAND, send_broadcast)]},
@@ -357,9 +362,9 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback, pattern="^fav_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🚀 100X Mukammal Anime Bot ishga tushdi...")
+    print("🚀 Bot muvaffaqiyatli ishga tushdi va Port tinglanmoqda...")
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
+
