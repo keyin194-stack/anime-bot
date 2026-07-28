@@ -1,148 +1,365 @@
+import asyncio
 import logging
 import os
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+import time
+import aiosqlite
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    ConversationHandler,
     MessageHandler,
     filters,
 )
 
+# Logging sozlamalari
 logging.basicConfig(level=logging.INFO)
 
-# --- BOT SOZLAMALARI ---
+# --- BOT VA KANAL SOZLAMALARI ---
 TOKEN = os.getenv("BOT_TOKEN", "8827905488:AAF-BsNgLJTIangTAG0-QgF2Z9m6h8lpPQM")
 CHANNEL_ID = -1003947988121
-
 CHANNEL_INVITE_LINK = "https://t.me/+6SRxU-O-aYFiZjgy"
 INSTAGRAM_URL = "https://www.instagram.com/cz_yagami?igsh=MWt2YzdzNWVrOTc0eA=="
 ADMIN_ID = 5560186689
+DB_NAME = "anime.db"
 
-USERS = set()
+# Anti-spam chegara vaqti (sekund)
+SPAM_THRESHOLD = 1.2
+LAST_MESSAGE_TIME = {}
+BROADCAST_STATE = 1
 
 
+# --- MA'LUMOTLAR BAZASI (SQLite Asinxron) ---
+async def init_db():
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS animes (
+                code INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                category TEXT DEFAULT 'Umumiy',
+                message_id INTEGER NOT NULL
+            )
+        ''')
+        await db.execute('''
+            CREATE TABLE IF NOT EXISTS favorites (
+                user_id INTEGER,
+                code INTEGER,
+                PRIMARY KEY (user_id, code)
+            )
+        ''')
+        await db.commit()
+
+async def add_user(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+        await db.commit()
+
+async def get_all_users():
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT user_id FROM users') as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+async def get_users_count() -> int:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT COUNT(*) FROM users') as cursor:
+            res = await cursor.fetchone()
+            return res[0] if res else 0
+
+async def add_anime(code: int, title: str, category: str, message_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        await db.execute(
+            'INSERT OR REPLACE INTO animes (code, title, category, message_id) VALUES (?, ?, ?, ?)',
+            (code, title, category, message_id)
+        )
+        await db.commit()
+
+async def get_anime_by_code(code: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT title, category, message_id FROM animes WHERE code = ?', (code,)) as cursor:
+            return await cursor.fetchone()
+
+async def search_anime(query: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT code, title FROM animes WHERE LOWER(title) LIKE ? LIMIT 10', (f"%{query.lower()}%",)) as cursor:
+            return await cursor.fetchall()
+
+async def get_categories():
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT DISTINCT category FROM animes') as cursor:
+            return [row[0] for row in await cursor.fetchall()]
+
+async def get_animes_by_category(category: str):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT code, title FROM animes WHERE category = ? LIMIT 20', (category,)) as cursor:
+            return await cursor.fetchall()
+
+async def toggle_favorite(user_id: int, code: int) -> bool:
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('SELECT 1 FROM favorites WHERE user_id = ? AND code = ?', (user_id, code)) as cursor:
+            exists = await cursor.fetchone()
+        if exists:
+            await db.execute('DELETE FROM favorites WHERE user_id = ? AND code = ?', (user_id, code))
+            await db.commit()
+            return False
+        else:
+            await db.execute('INSERT INTO favorites (user_id, code) VALUES (?, ?)', (user_id, code))
+            await db.commit()
+            return True
+
+async def get_user_favorites(user_id: int):
+    async with aiosqlite.connect(DB_NAME) as db:
+        async with db.execute('''
+            SELECT a.code, a.title FROM favorites f 
+            JOIN animes a ON f.code = a.code 
+            WHERE f.user_id = ?
+        ''', (user_id,)) as cursor:
+            return await cursor.fetchall()
+
+
+# --- TUGMALAR ---
+def get_sub_keyboard():
+    keyboard = [
+        [InlineKeyboardButton("📢 Rasmiy Kanalimiz", url=CHANNEL_INVITE_LINK)],
+        [InlineKeyboardButton("📸 Bizning Instagram", url=INSTAGRAM_URL)],
+        [InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_sub")]
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+def get_main_reply_keyboard():
+    keyboard = [
+        ["🔍 Qidiruv", "📂 Kategoriyalar"],
+        ["❤️ Sevimlilar", "ℹ️ Bot haqida"]
+    ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+
+def get_anime_action_keyboard(code: int):
+    keyboard = [
+        [InlineKeyboardButton("❤️ / 💔 Sevimlilarga qo'shish/o'chirish", callback_data=f"fav_{code}")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+# --- TEKSHIRUV KODI ---
 async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
-        member = await context.bot.get_chat_member(
-            chat_id=CHANNEL_ID, user_id=user_id
-        )
+        member = await context.bot.get_chat_member(chat_id=CHANNEL_ID, user_id=user_id)
         return member.status in ["creator", "administrator", "member"]
     except Exception as e:
         logging.error(f"Obuna tekshirishda xatolik: {e}")
         return True
 
 
-def get_sub_keyboard():
-    keyboard = [
-        [InlineKeyboardButton("📢 Rasmiy Kanalimiz", url=CHANNEL_INVITE_LINK)],
-        [InlineKeyboardButton("📸 Bizning Instagram", url=INSTAGRAM_URL)],
-        [InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_sub")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
-
-
+# --- HANDLERLAR ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    USERS.add(user_id)
+    await add_user(user_id)
 
     if not await is_subscribed(user_id, context):
         await update.message.reply_text(
-            "⚠️ **Botdan foydalanish uchun rasmiy kanalimizga a'zo bo'ling!**\n\n"
+            "⚠️ **Botdan foydalanish uchun rasmiy kanalimiz va Instagram sahifamizga a'zo bo'ling!**\n\n"
             "A'zo bo'lgach, **'✅ Obunani tekshirish'** tugmasini bosing.",
-            reply_markup=get_sub_keyboard(),
-            parse_mode="Markdown",
+            reply_markup=get_sub_keyboard(), parse_mode="Markdown"
         )
         return
 
     await update.message.reply_text(
         f"Salom, **{update.effective_user.first_name}**! ⛩️\n\n"
-        "🎬 Anime tomosha qilish uchun uning **kodini** (masalan: `1`, `2`...) yuboring!\n\n"
-        "Yoqimli tomosha! 🍿",
-        parse_mode="Markdown",
+        "🎬 Anime tomosha qilish uchun uning **kodini** (masalan: `1`, `2`...) yuboring yoki nomini yozib qidiring!",
+        reply_markup=get_main_reply_keyboard(), parse_mode="Markdown"
     )
 
-
-async def check_sub_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
+async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    user_id = query.from_user.id
-    if await is_subscribed(user_id, context):
-        await query.message.edit_text(
-            "✅ **Obunangiz tasdiqlandi!**\n\n"
-            "Endi anime kodini (masalan: `1` yoki `2`) yuborishingiz mumkin! ⛩️",
-            parse_mode="Markdown",
-        )
+    if await is_subscribed(query.from_user.id, context):
+        await query.message.edit_text("✅ **Obunangiz tasdiqlandi!** Endi anime kodini yuborishingiz mumkin. 🍿", parse_mode="Markdown")
     else:
-        await query.message.reply_text(
-            "❌ Hali kanalimizga a'zo bo'lmadingiz. Iltimos, avval a'zo bo'ling!",
-            show_alert=True,
-        )
-
+        await query.message.reply_text("❌ Hali kanalimizga a'zo bo'lmadingiz. Iltimos, avval a'zo bo'ling!", show_alert=True)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    USERS.add(user_id)
+    now = time.time()
+
+    # Anti-Spam
+    if user_id in LAST_MESSAGE_TIME and (now - LAST_MESSAGE_TIME[user_id]) < SPAM_THRESHOLD:
+        await update.message.reply_text("⚠️ **Iltimos, ketma-ket Juda tez xabar yubormang! (Anti-Spam)**", parse_mode="Markdown")
+        return
+    LAST_MESSAGE_TIME[user_id] = now
+
+    await add_user(user_id)
 
     if not await is_subscribed(user_id, context):
-        await update.message.reply_text(
-            "⚠️ Botdan foydalanish uchun kanalimizga a'zo bo'lishingiz kerak!",
-            reply_markup=get_sub_keyboard(),
-            parse_mode="Markdown",
-        )
+        await update.message.reply_text("⚠️ Botdan foydalanish uchun rasmiy kanalimizga a'zo bo'ling!", reply_markup=get_sub_keyboard())
         return
 
     text = update.message.text.strip()
 
-    if text.isdigit():
-        msg_id = int(text)
-        await update.message.reply_text("⏳ Anime yuklanmoqda, biroz kuting...")
+    # Menyu matnlari
+    if text == "🔍 Qidiruv":
+        await update.message.reply_text("🔍 **Anime nomini yozib yuboring (masalan: `Death Note`):**", parse_mode="Markdown")
+        return
+    elif text == "❤️ Sevimlilar":
+        favs = await get_user_favorites(user_id)
+        if not favs:
+            await update.message.reply_text("💔 **Sevimlilar ro'yxatingiz hozircha bo'sh!**", parse_mode="Markdown")
+            return
+        msg = "❤️ **Sizning Sevimli Animelaringiz:**\n\n"
+        for code, title in favs:
+            msg += f"🎬 **{title}** — Kodi: `{code}`\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+    elif text == "📂 Kategoriyalar":
+        cats = await get_categories()
+        if not cats:
+            await update.message.reply_text("📂 Hozircha bazada kategoriyalar mavjud emas.")
+            return
+        msg = "📂 **Mavjud Kategoriyalar:**\n\n" + "\n".join([f"• `{c}`" for c in cats])
+        msg += "\n\nKategoriya bo'yicha ko'rish uchun o'sha kategoriya nomini botga yozib yuboring."
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+    elif text == "ℹ️ Bot haqida":
+        await update.message.reply_text("⛩️ **Anime Bot** — Sizga eng sevimli animelaringizni sifatli va tezkor taqdim etuvchi bot!", parse_mode="Markdown")
+        return
 
+    # Kategoriya bo'yicha
+    cats = await get_categories()
+    if text in cats:
+        animes = await get_animes_by_category(text)
+        msg = f"📂 **{text}** kategoriyasidagi animelar:\n\n"
+        for code, title in animes:
+            msg += f"🎬 **{title}** — Kodi: `{code}`\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # Anime kodi orqali ko'rish
+    if text.isdigit():
+        code = int(text)
+        anime = await get_anime_by_code(code)
+        msg_id = anime[2] if anime else code
+
+        await update.message.reply_text("⏳ Anime yuklanmoqda, biroz kuting...")
         try:
             await context.bot.copy_message(
-                chat_id=update.effective_chat.id,
-                from_chat_id=CHANNEL_ID,
+                chat_id=update.effective_chat.id, 
+                from_chat_id=CHANNEL_ID, 
                 message_id=msg_id,
+                reply_markup=get_anime_action_keyboard(code)
             )
         except Exception:
-            await update.message.reply_text(
-                "❌ Bunday kodli anime topilmadi yoki hali yuklanmagan!"
-            )
+            await update.message.reply_text("❌ Bunday kodli anime topilmadi yoki xabar kanaldan o'chirilgan!")
     else:
-        await update.message.reply_text(
-            "❌ Iltimos, faqat anime kodini raqam ko'rinishida yuboring (masalan: 1)!"
-        )
+        # Nom bo'yicha qidiruv
+        results = await search_anime(text)
+        if not results:
+            await update.message.reply_text("❌ Afsuski, bunday nomli anime topilmadi.")
+            return
+        msg = "🔍 **Topilgan Animelar:**\n\n"
+        for code, title in results:
+            msg += f"🎬 **{title}** — Kodi: `{code}`\n"
+        msg += "\n👇 *Ko'rish uchun anime kodini raqam shaklida yuboring!*"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data.startswith("fav_"):
+        code = int(data.split("_")[1])
+        status = await toggle_favorite(query.from_user.id, code)
+        text = "❤️ Sevimlilarga qo'shildi!" if status else "💔 Sevimlilardan olib tashlandi!"
+        await query.message.reply_text(text)
 
 
-async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id == ADMIN_ID:
-        await update.message.reply_text(
-            f"📊 **BOT STATISTIKASI:**\n\n" f"👥 Jami foydalanuvchilar: **{len(USERS)}** ta",
-            parse_mode="Markdown",
-        )
-
-
-def main():
-    app = Application.builder().token(TOKEN).build()
-
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stat", stat))
-    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
-    app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+# --- ADMIN PANEL VA BROADCAST ---
+async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    count = await get_users_count()
+    await update.message.reply_text(
+        f"👑 **ADMIN PANEL**\n\n"
+        f"📊 **Bot foydalanuvchilari:** `{count}` ta\n\n"
+        f"⚙️ **Buyruqlar:**\n"
+        f"👉 `/add kod | nomi | kategoriya | post_id` - Animeni bazaga qo'shish\n"
+        f"👉 `/send` - Barcha obunachilarga xabar yuborish (Broadcast)",
+        parse_mode="Markdown"
     )
 
-    print("Bot muvaffaqiyatli ishga tushdi...")
+async def add_anime_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return
+    try:
+        raw_text = " ".join(context.args)
+        parts = [p.strip() for p in raw_text.split("|")]
+        code = int(parts[0])
+        title = parts[1]
+        category = parts[2]
+        msg_id = int(parts[3])
+
+        await add_anime(code, title, category, msg_id)
+        await update.message.reply_text(f"✅ **Anime bazaga qo'shildi!**\nKodi: `{code}`\nNomi: **{title}**\nKategoriya: **{category}**", parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text("❌ Noto'g'ri format!\nMasalan: `/add 1 | Death Note | Detektiv | 2`", parse_mode="Markdown")
+
+async def start_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    await update.message.reply_text("📢 **Barcha foydalanuvchilarga yuboriladigan xabarni kiriting (yoki /cancel deb yozing):**")
+    return BROADCAST_STATE
+
+async def send_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    users = await get_all_users()
+    count = 0
+    await update.message.reply_text("🚀 Broadcast xabarlarini yuborish boshlandi...")
+
+    for u_id in users:
+        try:
+            await update.message.copy(chat_id=u_id)
+            count += 1
+            await asyncio.sleep(0.04) # Telegram chekloviga tushmaslik uchun
+        except Exception:
+            pass
+
+    await update.message.reply_text(f"✅ Xabar muvaffaqiyatli **{count}** ta foydalanuvchiga yetkazildi!")
+    return ConversationHandler.END
+
+async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("❌ Broadcast bekor qilindi.")
+    return ConversationHandler.END
+
+
+# --- ISHGA TUSHIRISH (MAIN) ---
+def main():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(init_db())
+
+    app = Application.builder().token(TOKEN).build()
+
+    # Broadcast conversation
+    broadcast_handler = ConversationHandler(
+        entry_points=[CommandHandler("send", start_broadcast)],
+        states={BROADCAST_STATE: [MessageHandler(filters.ALL & ~filters.COMMAND, send_broadcast)]},
+        fallbacks=[CommandHandler("cancel", cancel_broadcast)]
+    )
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stat", stat_command))
+    app.add_handler(CommandHandler("add", add_anime_command))
+    app.add_handler(broadcast_handler)
+
+    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
+    app.add_handler(CallbackQueryHandler(handle_callback, pattern="^fav_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("🚀 100X Mukammal Anime Bot ishga tushdi...")
     app.run_polling()
 
 
 if __name__ == "__main__":
     main()
-    
-    
-    
-  
