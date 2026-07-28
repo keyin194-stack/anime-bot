@@ -10,27 +10,19 @@ from telegram.ext import (
     filters,
 )
 
-# Logging
 logging.basicConfig(level=logging.INFO)
 
 # --- BOT SOZLAMALARI ---
 TOKEN = os.getenv("BOT_TOKEN", "8827905488:AAF-BsNgLJTIangTAG0-QgF2Z9m6h8lpPQM")
-
-# Baza kanal ID-si
 CHANNEL_ID = -1003947988121
 
-# Havolalar
 CHANNEL_INVITE_LINK = "https://t.me/+6SRxU-O-aYFiZjgy"
 INSTAGRAM_URL = "https://www.instagram.com/cz_yagami?igsh=MWt2YzdzNWVrOTc0eA=="
-
-# Admin Telegram ID (Light / @LeviAckerman765)
 ADMIN_ID = 5560186689
 
-# Foydalanuvchilar ro'yxati
 USERS = set()
 
 
-# Kanallarga obunani tekshirish
 async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     try:
         member = await context.bot.get_chat_member(
@@ -42,7 +34,6 @@ async def is_subscribed(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> boo
         return True
 
 
-# Obuna tugmalari
 def get_sub_keyboard():
     keyboard = [
         [InlineKeyboardButton("📢 Rasmiy Kanalimiz", url=CHANNEL_INVITE_LINK)],
@@ -52,7 +43,6 @@ def get_sub_keyboard():
     return InlineKeyboardMarkup(keyboard)
 
 
-# /start buyrug'i
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     USERS.add(user_id)
@@ -74,7 +64,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# Obunani tekshirish tugmasi bosilganda
 async def check_sub_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
@@ -95,7 +84,6 @@ async def check_sub_callback(
         )
 
 
-# Anime kodini qabul qilish
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     USERS.add(user_id)
@@ -115,7 +103,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ Anime yuklanmoqda, biroz kuting...")
 
         try:
-            # Kanaldagi post raqami bo'yicha videoni foydalanuvchiga yuboradi
             await context.bot.copy_message(
                 chat_id=update.effective_chat.id,
                 from_chat_id=CHANNEL_ID,
@@ -131,7 +118,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# Admin uchun /stat buyrug'i
 async def stat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id == ADMIN_ID:
         await update.message.reply_text(
@@ -156,6 +142,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
     
     
   
