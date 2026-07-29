@@ -2,12 +2,12 @@ import asyncio
 import logging
 import os
 import sqlite3
-import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application,
+    ApplicationBuilder,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -31,7 +31,7 @@ class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bot ishlamoqda!")
+        self.wfile.write(b"Bot is running successfully!")
 
     def log_message(self, format, *args):
         pass
@@ -42,17 +42,13 @@ def start_health_server():
         server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
         server.serve_forever()
     except Exception as e:
-        logging.error(f"Health server xatosi: {e}")
+        logging.error(f"Health server error: {e}")
 
-# --- BAZA BILAN ISHLASH (SQLITE) ---
+# --- BAZA (SQLITE) ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY
-        )
-    ''')
+    cursor.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)')
     conn.commit()
     conn.close()
 
@@ -71,7 +67,7 @@ def get_users_count() -> int:
     conn.close()
     return count
 
-# --- TUGMALAR (KEYBOARD) ---
+# --- TUGMALAR ---
 def get_sub_keyboard():
     keyboard = [
         [InlineKeyboardButton("📸 Instagram sahifamiz", url=INSTAGRAM_URL)],
@@ -79,9 +75,7 @@ def get_sub_keyboard():
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# --- BOT BUYRUQLARI VA MANTIG'I ---
-
-# /start buyrug'i
+# --- HANDLERLAR ---
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     add_user(user_id)
@@ -94,7 +88,6 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Inline tugma bosilganda (Obunani tekshirish)
 async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -105,7 +98,6 @@ async def check_sub_callback(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown"
     )
 
-# /stat buyrug'i (faqat admin uchun)
 async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if user_id != ADMIN_ID:
@@ -118,26 +110,23 @@ async def stat_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# Kod kelganda kanaldan animeni tashlab berish
 async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     add_user(user_id)
 
     text = update.message.text.strip()
 
-    # Agar yuborilgan matn raqam bo'lsa
     if text.isdigit():
         msg_id = int(text)
         await update.message.reply_text("⏳ Anime qidirilmoqda...")
         try:
-            # Kanaldan o'sha ID dagi postni foydalanuvchiga nusxalab yuboradi
             await context.bot.copy_message(
                 chat_id=update.effective_chat.id,
                 from_chat_id=CHANNEL_ID,
                 message_id=msg_id
             )
         except Exception as e:
-            logging.error(f"Postni yuborishda xatolik: {e}")
+            logging.error(f"Post yuborishda xatolik: {e}")
             await update.message.reply_text(
                 "❌ **Bunday kodli anime topilmadi!**\n\n"
                 "Iltimos, kod to'g'riligini tekshirib qaytadan kiriting.",
@@ -150,21 +139,32 @@ async def handle_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=get_sub_keyboard()
         )
 
-# --- MAIN ---
-def main():
+# --- MAIN ASYNC ---
+async def main():
     init_db()
+
+    # Health check serverni fonda yurgizamiz
     threading.Thread(target=start_health_server, daemon=True).start()
 
-    app = Application.builder().token(TOKEN).build()
+    application = ApplicationBuilder().token(TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("stat", stat_command))
-    app.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_code))
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("stat", stat_command))
+    application.add_handler(CallbackQueryHandler(check_sub_callback, pattern="^check_sub$"))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_code))
 
-    print("🚀 Bot muvaffaqiyatli ishga tushdi!")
-    app.run_polling()
+    async with application:
+        await application.start()
+        await application.updater.start_polling()
+        print("🚀 Bot muvaffaqiyatli ishga tushdi va ishlamoqda!")
+        # Bot to'xtab qolmasligi uchun cheksiz loop
+        while True:
+            await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
+            
     
