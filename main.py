@@ -32,7 +32,7 @@ SPAM_THRESHOLD = 1.2
 LAST_MESSAGE_TIME = {}
 BROADCAST_STATE = 1
 
-# --- RENDER PORT HEALTH CHECK ---
+# --- RENDER PORT HEALTH CHECK SERVER ---
 class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -125,7 +125,7 @@ async def toggle_favorite(user_id: int, code: int) -> bool:
             await db.commit()
             return False
         else:
-            await db.execute('INSERT INTO favorites (user_id, code) VALUES (?, ?)', (user_id, code))
+            await db.execute('INSERT FROM favorites (user_id, code) VALUES (?, ?)', (user_id, code))
             await db.commit()
             return True
 
@@ -341,10 +341,17 @@ async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Broadcast bekor qilindi.")
     return ConversationHandler.END
 
-# --- MAIN RUNNER ---
-async def run_bot():
+# --- POST INITIALIZATION FOR DB ---
+async def post_init(application: Application):
     await init_db()
-    app = Application.builder().token(TOKEN).build()
+
+# --- MAIN ---
+def main():
+    # Health check serverini fonda yurgizamiz
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # Application tayyorlaymiz
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
     broadcast_handler = ConversationHandler(
         entry_points=[CommandHandler("send", start_broadcast)],
@@ -362,21 +369,12 @@ async def run_bot():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("🚀 Bot muvaffaqiyatli ishga tushdi va Polling boshlandi...")
-    
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    
-    # Bot to'xtab qolmasligi uchun kutish
-    while True:
-        await asyncio.sleep(3600)
+    # Standart xatosiz run_polling
+    app.run_polling()
 
 if __name__ == "__main__":
-    # Health check serverini fonda ishga tushiramiz
-    t = threading.Thread(target=start_health_server, daemon=True)
-    t.start()
-    
-    # Event loop ni to'g'ri shaklda yuritish
-    asyncio.run(run_bot())
+    main()
+        
+
     
 
