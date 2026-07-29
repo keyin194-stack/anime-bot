@@ -4,6 +4,7 @@ import os
 import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+
 import aiosqlite
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, Update
 from telegram.ext import (
@@ -31,20 +32,24 @@ SPAM_THRESHOLD = 1.2
 LAST_MESSAGE_TIME = {}
 BROADCAST_STATE = 1
 
-# --- RENDER PORTINI ALDASH UCHUN DUMMY SERVER ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
+# --- RENDER PORT HEALTH CHECK ---
+class SimpleHTTPRequestHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
+        self.send_header("Content-type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"Bot ishlayapti!")
+        self.wfile.write(b"Bot is running successfully!")
 
     def log_message(self, format, *args):
-        return
+        pass
 
-def run_dummy_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+def start_health_server():
+    try:
+        port = int(os.getenv("PORT", 10000))
+        server = HTTPServer(("0.0.0.0", port), SimpleHTTPRequestHandler)
+        server.serve_forever()
+    except Exception as e:
+        logging.error(f"Health server error: {e}")
 
 # --- DATABASE ---
 async def init_db():
@@ -336,15 +341,9 @@ async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ Broadcast bekor qilindi.")
     return ConversationHandler.END
 
-# --- MAIN ---
-def main():
-    # Render Port xatosini oldini olish uchun dummy web serverni alohida potokda ishga tushiramiz
-    threading.Thread(target=run_dummy_server, daemon=True).start()
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(init_db())
-
+# --- MAIN RUNNER ---
+async def run_bot():
+    await init_db()
     app = Application.builder().token(TOKEN).build()
 
     broadcast_handler = ConversationHandler(
@@ -362,9 +361,22 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback, pattern="^fav_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("🚀 Bot muvaffaqiyatli ishga tushdi va Port tinglanmoqda...")
-    app.run_polling()
+    print("🚀 Bot muvaffaqiyatli ishga tushdi va Polling boshlandi...")
+    
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling()
+    
+    # Bot to'xtab qolmasligi uchun kutish
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
-    main()
+    # Health check serverini fonda ishga tushiramiz
+    t = threading.Thread(target=start_health_server, daemon=True)
+    t.start()
+    
+    # Event loop ni to'g'ri shaklda yuritish
+    asyncio.run(run_bot())
+    
 
